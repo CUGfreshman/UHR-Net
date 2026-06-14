@@ -1,15 +1,20 @@
+import argparse
 import os
-import cv2
-import numpy as np
 import pickle
-from skimage.measure import label, regionprops
-from scipy.ndimage import distance_transform_edt
-from tqdm import tqdm
 
 # UO-IC metadata builder: instance masks and distance map for geometry-aware copy-paste.
-BASE_DIR = "/root/autodl-tmp/this/medical_SO_seg/projects/data"
-DATASET_NAME = "Kvasir-SEG_maoBian_fixed"
+DEFAULT_DATA_ROOT = "data"
+DEFAULT_DATASET_NAME = "Kvasir-SEG_maoBian_fixed"
 MIN_AREA_THRESHOLD = 15
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Build UO-IC metadata for Kvasir-SEG.")
+    parser.add_argument("--data-root", default=DEFAULT_DATA_ROOT, help="Root directory containing dataset folders.")
+    parser.add_argument("--dataset", default=DEFAULT_DATASET_NAME, help="Dataset folder name under --data-root.")
+    parser.add_argument("--output", default=None, help="Output metadata path. Defaults to dataset/preprocessed_metadata.pkl.")
+    parser.add_argument("--min-area", type=int, default=MIN_AREA_THRESHOLD, help="Minimum connected-component area to keep.")
+    return parser.parse_args()
 
 
 def find_dataset_files(dataset_path):
@@ -25,7 +30,13 @@ def find_dataset_files(dataset_path):
     return sorted(list(all_filenames))
 
 
-def process_dataset(dataset_path, output_path):
+def process_dataset(dataset_path, output_path, min_area_threshold=MIN_AREA_THRESHOLD):
+    import cv2
+    import numpy as np
+    from scipy.ndimage import distance_transform_edt
+    from skimage.measure import label, regionprops
+    from tqdm import tqdm
+
     def resolve_path(directory, base_name, extensions):
         for ext in extensions:
             candidate = os.path.join(directory, base_name + ext)
@@ -60,7 +71,7 @@ def process_dataset(dataset_path, output_path):
         initial_labels = label(binary_mask)
         clean_mask = np.zeros_like(binary_mask, dtype=np.uint8)
         for prop in regionprops(initial_labels):
-            if prop.area >= MIN_AREA_THRESHOLD:
+            if prop.area >= min_area_threshold:
                 clean_mask[initial_labels == prop.label] = 255
 
         distance_map = distance_transform_edt((clean_mask == 0).astype(np.uint8))
@@ -83,10 +94,11 @@ def process_dataset(dataset_path, output_path):
 
 
 if __name__ == "__main__":
-    dataset_full_path = os.path.join(BASE_DIR, DATASET_NAME)
-    output_meta_file = os.path.join(dataset_full_path, "preprocessed_metadata.pkl")
+    args = parse_args()
+    dataset_full_path = os.path.join(args.data_root, args.dataset)
+    output_meta_file = args.output or os.path.join(dataset_full_path, "preprocessed_metadata.pkl")
 
     if not os.path.isdir(dataset_full_path):
         print(f"Error: dataset path not found: {dataset_full_path}")
     else:
-        process_dataset(dataset_full_path, output_meta_file)
+        process_dataset(dataset_full_path, output_meta_file, args.min_area)

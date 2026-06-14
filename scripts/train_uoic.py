@@ -1,30 +1,41 @@
-import os
-import sys
-import random
-import time
+import argparse
 import datetime
-import numpy as np
-import albumentations as A
-import torch
-from torch.utils.data import DataLoader
+import os
+import random
+import sys
+import time
+
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from utils.utils import print_and_save, shuffling, epoch_time
-from utils.metrics import DiceBCELoss
-from data.io import load_data
-from data.uoic_dataset import UOICDataset
-from engine.uoic_engine import train, evaluate
-from models.uoic_pretrain import UOICPretrainNet
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Stage-1 UO-IC pretraining for UHR-Net.")
+    parser.add_argument("--data-root", default="data", help="Root directory containing dataset folders.")
+    parser.add_argument("--dataset", default="Kvasir-SEG_maoBian_fixed", help="Dataset folder name under --data-root.")
+    parser.add_argument("--val-name", default=None, help="Validation split suffix, e.g. fold1 uses val_fold1.txt.")
+    parser.add_argument("--metadata-path", default=None, help="Path to preprocessed_metadata.pkl. Defaults to dataset folder.")
+    parser.add_argument("--output-root", default="run_files", help="Directory used for training logs and checkpoints.")
+    parser.add_argument("--run-name", default=None, help="Optional run folder name. Defaults to stage1_<dataset>_<timestamp>.")
+    parser.add_argument("--image-size", type=int, default=256, help="Square input size used for training and validation.")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size.")
+    parser.add_argument("--epochs", type=int, default=300, help="Maximum number of training epochs.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--early-stopping-patience", type=int, default=100, help="Stop after this many epochs without mIoU improvement.")
+    parser.add_argument("--resume", default=None, help="Optional stage-1 checkpoint to resume from.")
+    parser.add_argument("--num-workers", type=int, default=8, help="DataLoader worker count.")
+    parser.add_argument("--seed", type=int, default=7, help="Random seed.")
+    parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"], help="Training device.")
+    return parser.parse_args()
 
 
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.deterministic = True
+def build_run_name(dataset_name, timestamp):
+    return f"stage1_{dataset_name}_{timestamp}"
 
 
-def my_seeding(seed):
+def my_seeding(seed, np, torch):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -33,37 +44,63 @@ def my_seeding(seed):
 
 
 def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
+    import numpy as np
+
+    worker_seed = torch_initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
 
-if __name__ == "__main__":
-    dataset_name = "Kvasir-SEG_maoBian_fixed"
-    val_name = None
+def torch_initial_seed():
+    import torch
 
-    seed = 7
-    my_seeding(seed)
+    return torch.initial_seed()
 
-    g = torch.Generator()
-    g.manual_seed(seed)
 
-    image_size = 256
-    batch_size = 16
-    num_epochs = 300
-    lr = 1e-4
-    early_stopping_patience = 100
+def resolve_device(torch, requested_device):
+    if requested_device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(requested_device)
 
-    resume_path = None
+
+def load_checkpoint_state(torch, path, map_location):
+    checkpoint = torch.load(path, map_location=map_location)
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model", "model_state_dict"):
+            if key in checkpoint:
+                return checkpoint[key]
+    return checkpoint
+
+
+def main():
+    args = parse_args()
+
+    import albumentations as A
+    import numpy as np
+    import torch
+    from torch.utils.data import DataLoader
+
+    from data.io import load_data
+    from data.uoic_dataset import UOICDataset
+    from engine.uoic_engine import evaluate, train
+    from models.uoic_pretrain import UOICPretrainNet
+    from utils.metrics import DiceBCELoss
+    from utils.utils import epoch_time, print_and_save, shuffling
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    my_seeding(args.seed, np, torch)
+
+    dataset_name = args.dataset
+    data_path = os.path.join(args.data_root, dataset_name)
+    preprocessed_path = args.metadata_path or os.path.join(data_path, "preprocessed_metadata.pkl")
+
+    generator = torch.Generator()
+    generator.manual_seed(args.seed)
 
     current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    folder_name = f"stage1_{dataset_name}_{val_name}_lr{lr}_{current_time}"
-
-    base_dir = "/root/autodl-tmp/this/medical_SO_seg/projects/data"
-    data_path = os.path.join(base_dir, dataset_name)
-    preprocessed_path = os.path.join(data_path, "preprocessed_metadata.pkl")
-
-    save_dir = os.path.join("run_files", dataset_name, folder_name)
+    folder_name = args.run_name or build_run_name(dataset_name, current_time)
+    save_dir = os.path.join(args.output_root, dataset_name, folder_name)
     os.makedirs(save_dir, exist_ok=True)
 
     train_log_path = os.path.join(save_dir, "train_log.txt")
@@ -72,13 +109,13 @@ if __name__ == "__main__":
     with open(train_log_path, "w") as train_log:
         train_log.write("\n")
 
-    datetime_object = str(datetime.datetime.now())
-    print_and_save(train_log_path, datetime_object)
+    print_and_save(train_log_path, str(datetime.datetime.now()))
     print("")
 
     hyperparameters_str = (
-        f"Image Size: {image_size}\nBatch Size: {batch_size}\nLR: {lr}\nEpochs: {num_epochs}\n"
-        f"Early Stopping Patience: {early_stopping_patience}\nSeed: {seed}\n"
+        f"Image Size: {args.image_size}\nBatch Size: {args.batch_size}\nLR: {args.lr}\nEpochs: {args.epochs}\n"
+        f"Early Stopping Patience: {args.early_stopping_patience}\nSeed: {args.seed}\n"
+        f"Data Path: {data_path}\nMetadata Path: {preprocessed_path}\n"
     )
     print_and_save(train_log_path, hyperparameters_str)
 
@@ -92,7 +129,7 @@ if __name__ == "__main__":
         A.CoarseDropout(p=0.3, max_holes=10, max_height=32, max_width=32),
     ])
 
-    (train_x, train_y), (valid_x, valid_y) = load_data(data_path, val_name)
+    (train_x, train_y), (valid_x, valid_y) = load_data(data_path, args.val_name)
     train_x, train_y = shuffling(train_x, train_y)
     data_str = f"Dataset Size:\nTrain: {len(train_x)} - Valid: {len(valid_x)}\n"
     print_and_save(train_log_path, data_str)
@@ -100,7 +137,7 @@ if __name__ == "__main__":
     train_dataset = UOICDataset(
         images_path=train_x,
         masks_path=train_y,
-        size=(image_size, image_size),
+        size=(args.image_size, args.image_size),
         preprocessed_path=preprocessed_path,
         geometric_transform=geometric_transform,
         image_only_transform=image_only_transform,
@@ -109,7 +146,7 @@ if __name__ == "__main__":
     valid_dataset = UOICDataset(
         images_path=valid_x,
         masks_path=valid_y,
-        size=(image_size, image_size),
+        size=(args.image_size, args.image_size),
         preprocessed_path=None,
         geometric_transform=None,
         image_only_transform=None,
@@ -118,46 +155,44 @@ if __name__ == "__main__":
 
     train_loader = DataLoader(
         dataset=train_dataset,
-        batch_size=batch_size,
+        batch_size=args.batch_size,
         shuffle=True,
-        num_workers=8,
+        num_workers=args.num_workers,
         worker_init_fn=seed_worker,
-        generator=g,
+        generator=generator,
     )
 
     valid_loader = DataLoader(
         dataset=valid_dataset,
-        batch_size=batch_size,
+        batch_size=args.batch_size,
         shuffle=False,
-        num_workers=8,
+        num_workers=args.num_workers,
         worker_init_fn=seed_worker,
-        generator=g,
+        generator=generator,
     )
 
-    device = torch.device("cuda")
+    device = resolve_device(torch, args.device)
     model = UOICPretrainNet()
 
-    if resume_path:
-        checkpoint = torch.load(resume_path, map_location="cpu")
+    if args.resume:
+        checkpoint = load_checkpoint_state(torch, args.resume, map_location="cpu")
         model.load_state_dict(checkpoint)
+        print_and_save(train_log_path, f"Resumed model from: {args.resume}")
 
     model = model.to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", patience=30, verbose=True)
     loss_fn = DiceBCELoss()
-    loss_name = "BCE Dice Loss"
-    data_str = f"Optimizer: Adam\nLoss: {loss_name}\n"
-    print_and_save(train_log_path, data_str)
+    print_and_save(train_log_path, "Optimizer: Adam\nLoss: BCE Dice Loss\n")
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    data_str = f"Number of parameters: {num_params / 1000000}M\n"
-    print_and_save(train_log_path, data_str)
+    print_and_save(train_log_path, f"Number of parameters: {num_params / 1000000}M\n")
 
     best_valid_metrics = 0.0
     early_stopping_count = 0
 
-    for epoch in range(num_epochs):
+    for epoch in range(args.epochs):
         start_time = time.time()
 
         train_loss_dict, train_metrics = train(model, train_loader, optimizer, loss_fn, device)
@@ -197,10 +232,14 @@ if __name__ == "__main__":
         )
         print_and_save(train_log_path, data_str)
 
-        if early_stopping_count == early_stopping_patience:
+        if early_stopping_count == args.early_stopping_patience:
             data_str = (
-                "Early stopping: validation loss stops improving from last "
-                f"{early_stopping_patience} continously.\n"
+                "Early stopping: validation mIoU stops improving from last "
+                f"{args.early_stopping_patience} epochs.\n"
             )
             print_and_save(train_log_path, data_str)
             break
+
+
+if __name__ == "__main__":
+    main()
