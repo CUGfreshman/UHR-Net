@@ -40,6 +40,7 @@
 <p align="center">
   <img src="assets/readme/main_results_table1.png" width="100%" alt="Main results on Kvasir-Sessile, Kvasir-SEG and GlaS">
 </p>
+
 ## 快速开始
 
 ### 1. 环境配置
